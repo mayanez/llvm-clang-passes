@@ -1,0 +1,96 @@
+From 9731e91b4cccf9b654b0c6ec04caaf41aea8b386 Mon Sep 17 00:00:00 2001
+From: Miguel Arroyo <miguel@arroyo.me>
+Date: Thu, 2 May 2019 05:03:03 +0000
+Subject: [PATCH 2/2] clang: Adds NoopInsertion to frontend driver.
+
+* `-fnoop-insertion` support
+---
+ clang/include/clang/Basic/CodeGenOptions.def | 2 ++
+ clang/include/clang/Driver/CC1Options.td     | 2 ++
+ clang/include/clang/Driver/Options.td        | 2 ++
+ clang/lib/CodeGen/BackendUtil.cpp            | 1 +
+ clang/lib/Driver/ToolChains/XCore.cpp        | 4 ++++
+ clang/lib/Frontend/CompilerInvocation.cpp    | 1 +
+ 6 files changed, 12 insertions(+)
+
+diff --git a/clang/include/clang/Basic/CodeGenOptions.def b/clang/include/clang/Basic/CodeGenOptions.def
+index ed2387b9a2e..f7f253010b5 100644
+--- a/clang/include/clang/Basic/CodeGenOptions.def
++++ b/clang/include/clang/Basic/CodeGenOptions.def
+@@ -364,6 +364,8 @@ CODEGENOPT(BranchTargetEnforcement, 1, 0)
+ /// Whether to emit unused static constants.
+ CODEGENOPT(KeepStaticConsts, 1, 0)
+ 
++CODEGENOPT(NoopInsertion     , 1, 0) ///< -dA, -fnoop-insertion.
++
+ #undef CODEGENOPT
+ #undef ENUM_CODEGENOPT
+ #undef VALUE_CODEGENOPT
+diff --git a/clang/include/clang/Driver/CC1Options.td b/clang/include/clang/Driver/CC1Options.td
+index 07c76884063..4ae9645cbb2 100644
+--- a/clang/include/clang/Driver/CC1Options.td
++++ b/clang/include/clang/Driver/CC1Options.td
+@@ -376,6 +376,8 @@ def msign_return_address_key_EQ : Joined<["-"], "msign-return-address-key=">,
+     Values<"a_key,b_key">;
+ def mbranch_target_enforce : Flag<["-"], "mbranch-target-enforce">;
+ def fno_dllexport_inlines : Flag<["-"], "fno-dllexport-inlines">;
++def mnoop_insertion: Flag<["-"], "mnoop-insertion">,
++  HelpText<"Insert no-op at BB start">;
+ 
+ //===----------------------------------------------------------------------===//
+ // Dependency Output Options
+diff --git a/clang/include/clang/Driver/Options.td b/clang/include/clang/Driver/Options.td
+index d02d9744d78..4f1c32a063b 100644
+--- a/clang/include/clang/Driver/Options.td
++++ b/clang/include/clang/Driver/Options.td
+@@ -1518,6 +1518,8 @@ def : Separate<["-"], "fnew-alignment">, Alias<fnew_alignment_EQ>;
+ def : Flag<["-"], "faligned-new">, Alias<faligned_allocation>;
+ def : Flag<["-"], "fno-aligned-new">, Alias<fno_aligned_allocation>;
+ def faligned_new_EQ : Joined<["-"], "faligned-new=">;
++def fnoop_insertion : Flag<["-"], "fnoop-insertion">, Group<f_Group>;
++def fno_noop_insertion : Flag<["-"], "fno-noop-insertion">, Group<f_Group>;
+ 
+ def fobjc_legacy_dispatch : Flag<["-"], "fobjc-legacy-dispatch">, Group<f_Group>;
+ def fobjc_new_property : Flag<["-"], "fobjc-new-property">, Group<clang_ignored_f_Group>;
+diff --git a/clang/lib/CodeGen/BackendUtil.cpp b/clang/lib/CodeGen/BackendUtil.cpp
+index b927acabac5..3c0595a9328 100644
+--- a/clang/lib/CodeGen/BackendUtil.cpp
++++ b/clang/lib/CodeGen/BackendUtil.cpp
+@@ -473,6 +473,7 @@ static void initTargetOptions(llvm::TargetOptions &Options,
+   Options.DebuggerTuning = CodeGenOpts.getDebuggerTuning();
+   Options.EmitStackSizeSection = CodeGenOpts.StackSizeSection;
+   Options.EmitAddrsig = CodeGenOpts.Addrsig;
++  Options.NoopInsertion = CodeGenOpts.NoopInsertion;
+ 
+   if (CodeGenOpts.getSplitDwarfMode() != CodeGenOptions::NoFission)
+     Options.MCOptions.SplitDwarfFile = CodeGenOpts.SplitDwarfFile;
+diff --git a/clang/lib/Driver/ToolChains/XCore.cpp b/clang/lib/Driver/ToolChains/XCore.cpp
+index 43175ad7d63..a7d701fc6ca 100644
+--- a/clang/lib/Driver/ToolChains/XCore.cpp
++++ b/clang/lib/Driver/ToolChains/XCore.cpp
+@@ -47,6 +47,10 @@ void tools::XCore::Assembler::ConstructJob(Compilation &C, const JobAction &JA,
+                    false))
+     CmdArgs.push_back("-fverbose-asm");
+ 
++  if (Args.hasFlag(options::OPT_fnoop_insertion, options::OPT_fno_noop_insertion,
++                   false))
++    CmdArgs.push_back("-fnoop-insertion");
++
+   Args.AddAllArgValues(CmdArgs, options::OPT_Wa_COMMA, options::OPT_Xassembler);
+ 
+   for (const auto &II : Inputs)
+diff --git a/clang/lib/Frontend/CompilerInvocation.cpp b/clang/lib/Frontend/CompilerInvocation.cpp
+index 3e6528c2598..bab0c7ac54b 100644
+--- a/clang/lib/Frontend/CompilerInvocation.cpp
++++ b/clang/lib/Frontend/CompilerInvocation.cpp
+@@ -802,6 +802,7 @@ static bool ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args, InputKind IK,
+       Args.hasFlag(OPT_fcoverage_mapping, OPT_fno_coverage_mapping, false);
+   Opts.DumpCoverageMapping = Args.hasArg(OPT_dump_coverage_mapping);
+   Opts.AsmVerbose = Args.hasArg(OPT_masm_verbose);
++  Opts.NoopInsertion = Args.hasArg(OPT_mnoop_insertion);
+   Opts.PreserveAsmComments = !Args.hasArg(OPT_fno_preserve_as_comments);
+   Opts.AssumeSaneOperatorNew = !Args.hasArg(OPT_fno_assume_sane_operator_new);
+   Opts.ObjCAutoRefCountExceptions = Args.hasArg(OPT_fobjc_arc_exceptions);
+-- 
+2.21.0
+

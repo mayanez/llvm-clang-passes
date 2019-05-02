@@ -1,0 +1,384 @@
+From 877fb62feefe59b6fe66a7eb2ea54e8c41c37075 Mon Sep 17 00:00:00 2001
+From: Miguel Arroyo <miguel@arroyo.me>
+Date: Thu, 2 May 2019 04:51:28 +0000
+Subject: [PATCH 1/2] llvm: NoopInsertion Backend Pass
+
+Support for:
+  * X86
+  * ARM
+  * AArch64
+---
+ llvm/include/llvm/CodeGen/CommandFlags.inc   |  6 +++
+ llvm/include/llvm/CodeGen/NoopInsertion.h    | 19 +++++++++
+ llvm/include/llvm/CodeGen/Passes.h           |  2 +
+ llvm/include/llvm/InitializePasses.h         |  1 +
+ llvm/include/llvm/Target/TargetOptions.h     |  3 ++
+ llvm/lib/CodeGen/CMakeLists.txt              |  1 +
+ llvm/lib/CodeGen/CodeGen.cpp                 |  1 +
+ llvm/lib/CodeGen/NoopInsertion.cpp           | 44 ++++++++++++++++++++
+ llvm/lib/CodeGen/TargetPassConfig.cpp        |  4 ++
+ llvm/lib/Target/AArch64/AArch64InstrInfo.cpp |  5 +++
+ llvm/lib/Target/AArch64/AArch64InstrInfo.h   |  1 +
+ llvm/lib/Target/ARM/ARMInstrInfo.cpp         | 18 ++++++++
+ llvm/lib/Target/ARM/ARMInstrInfo.h           |  3 ++
+ llvm/lib/Target/ARM/ARMInstrInfo.td          |  4 +-
+ llvm/lib/Target/X86/X86InstrInfo.cpp         |  6 +++
+ llvm/lib/Target/X86/X86InstrInfo.h           |  3 ++
+ llvm/test/CodeGen/ARM/noop-insert.ll         | 12 ++++++
+ llvm/test/CodeGen/X86/noop-insert.ll         | 15 +++++++
+ 18 files changed, 147 insertions(+), 1 deletion(-)
+ create mode 100644 llvm/include/llvm/CodeGen/NoopInsertion.h
+ create mode 100644 llvm/lib/CodeGen/NoopInsertion.cpp
+ create mode 100644 llvm/test/CodeGen/ARM/noop-insert.ll
+ create mode 100644 llvm/test/CodeGen/X86/noop-insert.ll
+
+diff --git a/llvm/include/llvm/CodeGen/CommandFlags.inc b/llvm/include/llvm/CodeGen/CommandFlags.inc
+index 568d329a5e8..b49f6e26327 100644
+--- a/llvm/include/llvm/CodeGen/CommandFlags.inc
++++ b/llvm/include/llvm/CodeGen/CommandFlags.inc
+@@ -239,6 +239,11 @@ static cl::opt<bool>
+                      cl::desc("Emit functions into separate sections"),
+                      cl::init(false));
+ 
++static cl::opt<bool>
++    NoopInsertion("noop-insertion",
++                  cl::desc("Add Noop Instructions to a BB."),
++                  cl::init(false));
++
+ static cl::opt<bool> EmulatedTLS("emulated-tls",
+                                  cl::desc("Use emulated TLS model"),
+                                  cl::init(false));
+@@ -295,6 +300,7 @@ static TargetOptions InitTargetOptionsFromCodeGenFlags() {
+   Options.RelaxELFRelocations = RelaxELFRelocations;
+   Options.DataSections = DataSections;
+   Options.FunctionSections = FunctionSections;
++  Options.NoopInsertion = NoopInsertion;
+   Options.UniqueSectionNames = UniqueSectionNames;
+   Options.EmulatedTLS = EmulatedTLS;
+   Options.ExplicitEmulatedTLS = EmulatedTLS.getNumOccurrences() > 0;
+diff --git a/llvm/include/llvm/CodeGen/NoopInsertion.h b/llvm/include/llvm/CodeGen/NoopInsertion.h
+new file mode 100644
+index 00000000000..f98ed808624
+--- /dev/null
++++ b/llvm/include/llvm/CodeGen/NoopInsertion.h
+@@ -0,0 +1,19 @@
++#ifndef LLVM_CODEGEN_NOOPINSERTION_H
++#define LLVM_CODEGEN_NOOPINSERTION_H
++
++#include "llvm/CodeGen/MachineFunctionPass.h"
++
++namespace llvm {
++  class NoopInsertion : public MachineFunctionPass {
++  public:
++    static char ID;
++
++    NoopInsertion();
++
++  private:
++    bool runOnMachineFunction(MachineFunction &MF) override;
++    void getAnalysisUsage(AnalysisUsage &AU) const override;
++  };
++}
++
++#endif
+diff --git a/llvm/include/llvm/CodeGen/Passes.h b/llvm/include/llvm/CodeGen/Passes.h
+index acf1ebb5bc8..b3f7c3ca2d3 100644
+--- a/llvm/include/llvm/CodeGen/Passes.h
++++ b/llvm/include/llvm/CodeGen/Passes.h
+@@ -364,6 +364,8 @@ namespace llvm {
+   /// the intrinsic for later emission to the StackMap.
+   extern char &StackMapLivenessID;
+ 
++  extern char &NoopInsertionID;
++
+   /// LiveDebugValues pass
+   extern char &LiveDebugValuesID;
+ 
+diff --git a/llvm/include/llvm/InitializePasses.h b/llvm/include/llvm/InitializePasses.h
+index 037c0dbb56e..b67b7628870 100644
+--- a/llvm/include/llvm/InitializePasses.h
++++ b/llvm/include/llvm/InitializePasses.h
+@@ -409,6 +409,7 @@ void initializeWinEHPreparePass(PassRegistry&);
+ void initializeWriteBitcodePassPass(PassRegistry&);
+ void initializeWriteThinLTOBitcodePass(PassRegistry&);
+ void initializeXRayInstrumentationPass(PassRegistry&);
++void initializeNoopInsertionPass(PassRegistry&);
+ 
+ } // end namespace llvm
+ 
+diff --git a/llvm/include/llvm/Target/TargetOptions.h b/llvm/include/llvm/Target/TargetOptions.h
+index b18101d9283..177518aeddc 100644
+--- a/llvm/include/llvm/Target/TargetOptions.h
++++ b/llvm/include/llvm/Target/TargetOptions.h
+@@ -115,6 +115,7 @@ namespace llvm {
+           EnableFastISel(false), EnableGlobalISel(false), UseInitArray(false),
+           DisableIntegratedAS(false), RelaxELFRelocations(false),
+           FunctionSections(false), DataSections(false),
++          NoopInsertion(false),
+           UniqueSectionNames(true), TrapUnreachable(false),
+           NoTrapAfterNoreturn(false), EmulatedTLS(false),
+           ExplicitEmulatedTLS(false), EnableIPRA(false),
+@@ -222,6 +223,8 @@ namespace llvm {
+     /// Emit data into separate sections.
+     unsigned DataSections : 1;
+ 
++    unsigned NoopInsertion : 1;
++
+     unsigned UniqueSectionNames : 1;
+ 
+     /// Emit target-specific trap instruction for 'unreachable' IR instructions.
+diff --git a/llvm/lib/CodeGen/CMakeLists.txt b/llvm/lib/CodeGen/CMakeLists.txt
+index e76f9f8ed4e..6e55e595a46 100644
+--- a/llvm/lib/CodeGen/CMakeLists.txt
++++ b/llvm/lib/CodeGen/CMakeLists.txt
+@@ -93,6 +93,7 @@ add_llvm_library(LLVMCodeGen
+   MachineSSAUpdater.cpp
+   MachineTraceMetrics.cpp
+   MachineVerifier.cpp
++  NoopInsertion.cpp
+   PatchableFunction.cpp
+   MIRPrinter.cpp
+   MIRPrintingPass.cpp
+diff --git a/llvm/lib/CodeGen/CodeGen.cpp b/llvm/lib/CodeGen/CodeGen.cpp
+index 66166482c78..c3b6f710f02 100644
+--- a/llvm/lib/CodeGen/CodeGen.cpp
++++ b/llvm/lib/CodeGen/CodeGen.cpp
+@@ -72,6 +72,7 @@ void llvm::initializeCodeGen(PassRegistry &Registry) {
+   initializeMachineSchedulerPass(Registry);
+   initializeMachineSinkingPass(Registry);
+   initializeMachineVerifierPassPass(Registry);
++  initializeNoopInsertionPass(Registry);
+   initializeOptimizePHIsPass(Registry);
+   initializePEIPass(Registry);
+   initializePHIEliminationPass(Registry);
+diff --git a/llvm/lib/CodeGen/NoopInsertion.cpp b/llvm/lib/CodeGen/NoopInsertion.cpp
+new file mode 100644
+index 00000000000..1e6cb5ede19
+--- /dev/null
++++ b/llvm/lib/CodeGen/NoopInsertion.cpp
+@@ -0,0 +1,44 @@
++#include "llvm/CodeGen/NoopInsertion.h"
++#include "llvm/ADT/Statistic.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineModuleInfo.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/CodeGen/Passes.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/Module.h"
++#include "llvm/Support/Allocator.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Target/TargetIntrinsicInfo.h"
++#include "llvm/CodeGen/TargetInstrInfo.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "noop-insertion"
++
++char NoopInsertion::ID = 0;
++char &llvm::NoopInsertionID = NoopInsertion::ID;
++INITIALIZE_PASS(NoopInsertion, "noop-insertion",
++                "Noop Insertion", false, false)
++
++NoopInsertion::NoopInsertion() : MachineFunctionPass(ID) {
++  initializeNoopInsertionPass(*PassRegistry::getPassRegistry());
++}
++
++void NoopInsertion::getAnalysisUsage(AnalysisUsage &AU) const {
++  AU.setPreservesCFG();
++  MachineFunctionPass::getAnalysisUsage(AU);
++}
++
++bool NoopInsertion::runOnMachineFunction(MachineFunction &Fn) {
++  const auto TII = Fn.getSubtarget().getInstrInfo();
++
++  unsigned FnInsertedNoopCount = 0;
++
++  for (auto &BB: Fn) {
++    TII->insertNoop(BB, BB.begin());
++    FnInsertedNoopCount++;
++  }
++
++  return FnInsertedNoopCount > 0;
++}
+diff --git a/llvm/lib/CodeGen/TargetPassConfig.cpp b/llvm/lib/CodeGen/TargetPassConfig.cpp
+index 28126fcf766..36caacf6ae3 100644
+--- a/llvm/lib/CodeGen/TargetPassConfig.cpp
++++ b/llvm/lib/CodeGen/TargetPassConfig.cpp
+@@ -950,6 +950,10 @@ void TargetPassConfig::addMachinePasses() {
+       addPass(createGCInfoPrinter(dbgs()), false, false);
+   }
+ 
++  if (TM->Options.NoopInsertion) {
++    addPass(&NoopInsertionID);
++  }
++
+   // Basic block placement.
+   if (getOptLevel() != CodeGenOpt::None)
+     addBlockPlacement();
+diff --git a/llvm/lib/Target/AArch64/AArch64InstrInfo.cpp b/llvm/lib/Target/AArch64/AArch64InstrInfo.cpp
+index 50316ebe218..4e57a579684 100644
+--- a/llvm/lib/Target/AArch64/AArch64InstrInfo.cpp
++++ b/llvm/lib/Target/AArch64/AArch64InstrInfo.cpp
+@@ -3417,6 +3417,11 @@ void AArch64InstrInfo::getNoop(MCInst &NopInst) const {
+   NopInst.addOperand(MCOperand::createImm(0));
+ }
+ 
++void AArch64InstrInfo::insertNoop(MachineBasicBlock &MBB, MachineBasicBlock::iterator MI) const {
++  DebugLoc DL;
++  BuildMI(MBB, MI, DL, get(AArch64::HINT)).addImm(0);
++}
++
+ // AArch64 supports MachineCombiner.
+ bool AArch64InstrInfo::useMachineCombiner() const { return true; }
+ 
+diff --git a/llvm/lib/Target/AArch64/AArch64InstrInfo.h b/llvm/lib/Target/AArch64/AArch64InstrInfo.h
+index e48c26d4a84..6d54484a437 100644
+--- a/llvm/lib/Target/AArch64/AArch64InstrInfo.h
++++ b/llvm/lib/Target/AArch64/AArch64InstrInfo.h
+@@ -178,6 +178,7 @@ public:
+                     ArrayRef<MachineOperand> Cond, unsigned TrueReg,
+                     unsigned FalseReg) const override;
+   void getNoop(MCInst &NopInst) const override;
++  void insertNoop(MachineBasicBlock &MBB, MachineBasicBlock::iterator MI) const override;
+ 
+   bool isSchedulingBoundary(const MachineInstr &MI,
+                             const MachineBasicBlock *MBB,
+diff --git a/llvm/lib/Target/ARM/ARMInstrInfo.cpp b/llvm/lib/Target/ARM/ARMInstrInfo.cpp
+index bcc31f5fa4c..81f5a07011b 100644
+--- a/llvm/lib/Target/ARM/ARMInstrInfo.cpp
++++ b/llvm/lib/Target/ARM/ARMInstrInfo.cpp
+@@ -49,6 +49,24 @@ void ARMInstrInfo::getNoop(MCInst &NopInst) const {
+   }
+ }
+ 
++void ARMInstrInfo::insertNoop(MachineBasicBlock &MBB,
++                              MachineBasicBlock::iterator MI) const {
++  DebugLoc DL;
++  if (hasNOP()) {
++    BuildMI(MBB, MI, DL, get(ARM::HINT))
++      .addImm(0)
++      .addImm(ARMCC::AL)
++      .addReg(0);
++  } else {
++    BuildMI(MBB, MI, DL, get(ARM::MOVr))
++      .addReg(ARM::R0)
++      .addReg(ARM::R0)
++      .addImm(ARMCC::AL)
++      .addReg(0)
++      .addReg(0);
++  }
++}
++
+ unsigned ARMInstrInfo::getUnindexedOpcode(unsigned Opc) const {
+   switch (Opc) {
+   default:
+diff --git a/llvm/lib/Target/ARM/ARMInstrInfo.h b/llvm/lib/Target/ARM/ARMInstrInfo.h
+index c87fb97448c..5a2931e4b32 100644
+--- a/llvm/lib/Target/ARM/ARMInstrInfo.h
++++ b/llvm/lib/Target/ARM/ARMInstrInfo.h
+@@ -28,6 +28,9 @@ public:
+   /// Return the noop instruction to use for a noop.
+   void getNoop(MCInst &NopInst) const override;
+ 
++  void insertNoop(MachineBasicBlock &MBB,
++                  MachineBasicBlock::iterator MI) const override;
++
+   // Return the non-pre/post incrementing version of 'Opc'. Return 0
+   // if there is not such an opcode.
+   unsigned getUnindexedOpcode(unsigned Opc) const override;
+diff --git a/llvm/lib/Target/ARM/ARMInstrInfo.td b/llvm/lib/Target/ARM/ARMInstrInfo.td
+index 13abdc9687e..45a5745484a 100644
+--- a/llvm/lib/Target/ARM/ARMInstrInfo.td
++++ b/llvm/lib/Target/ARM/ARMInstrInfo.td
+@@ -6159,6 +6159,8 @@ def : InstAlias<"umull${s}${p} $RdLo, $RdHi, $Rn, $Rm",
+ def ITasm : ARMAsmPseudo<"it$mask $cc", (ins it_pred:$cc, it_mask:$mask)>,
+          ComplexDeprecationPredicate<"IT">;
+ 
++def NOP : ARMAsmPseudo<"nop", (ins)>, Sched<[]>;
++
+ let mayLoad = 1, mayStore =1, hasSideEffects = 1 in
+ def SPACE : PseudoInst<(outs GPR:$Rd), (ins i32imm:$size, GPR:$Rn),
+                        NoItinerary,
+@@ -6202,4 +6204,4 @@ def CompilerBarrier : PseudoInst<(outs), (ins i32imm:$ordering), NoItinerary,
+   let hasSideEffects = 1;
+   let Size = 0;
+   let AsmString = "@ COMPILER BARRIER";
+-}
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/X86/X86InstrInfo.cpp b/llvm/lib/Target/X86/X86InstrInfo.cpp
+index ab14ee7fadf..d7a9b40d7e9 100644
+--- a/llvm/lib/Target/X86/X86InstrInfo.cpp
++++ b/llvm/lib/Target/X86/X86InstrInfo.cpp
+@@ -6765,6 +6765,12 @@ void X86InstrInfo::getNoop(MCInst &NopInst) const {
+   NopInst.setOpcode(X86::NOOP);
+ }
+ 
++void X86InstrInfo::insertNoop(MachineBasicBlock &MBB,
++                              MachineBasicBlock::iterator MI) const {
++  DebugLoc DL;
++  BuildMI(MBB, MI, DL, get(X86::NOOP));
++}
++
+ bool X86InstrInfo::isHighLatencyDef(int opc) const {
+   switch (opc) {
+   default: return false;
+diff --git a/llvm/lib/Target/X86/X86InstrInfo.h b/llvm/lib/Target/X86/X86InstrInfo.h
+index 159cb50afc5..15c5033d891 100644
+--- a/llvm/lib/Target/X86/X86InstrInfo.h
++++ b/llvm/lib/Target/X86/X86InstrInfo.h
+@@ -441,6 +441,9 @@ public:
+ 
+   void getNoop(MCInst &NopInst) const override;
+ 
++  void insertNoop(MachineBasicBlock &MBB,
++                  MachineBasicBlock::iterator MI) const override;
++
+   bool
+   reverseBranchCondition(SmallVectorImpl<MachineOperand> &Cond) const override;
+ 
+diff --git a/llvm/test/CodeGen/ARM/noop-insert.ll b/llvm/test/CodeGen/ARM/noop-insert.ll
+new file mode 100644
+index 00000000000..21fb79ef86b
+--- /dev/null
++++ b/llvm/test/CodeGen/ARM/noop-insert.ll
+@@ -0,0 +1,12 @@
++; RUN: llc < %s -march=arm -noop-insertion | FileCheck %s
++; CHECK: nop
++; CHECK-NEXT: mla	r3, r0, r1, r2
++; CHECK-NEXT: mov r0, r3
++; CHECK-NEXT: mov pc, lr
++
++define i32 @test1(i32 %x, i32 %y, i32 %z) {
++entry:
++    %tmp = mul i32 %x, %y
++    %tmp2 = add i32 %tmp, %z
++    ret i32 %tmp2
++}
+\ No newline at end of file
+diff --git a/llvm/test/CodeGen/X86/noop-insert.ll b/llvm/test/CodeGen/X86/noop-insert.ll
+new file mode 100644
+index 00000000000..73e00dbbdfc
+--- /dev/null
++++ b/llvm/test/CodeGen/X86/noop-insert.ll
+@@ -0,0 +1,15 @@
++; RUN: llc < %s -mtriple=x86_64-linux -noop-insertion | FileCheck %s
++
++; CHECK: nop
++; CHECK-NEXT: # kill: def $edx killed $edx def $rdx
++; CHECK-NEXT: # kill: def $edi killed $edi def $rdi
++; CHECK-NEXT: imull
++; CHECK-NEXT: leal
++; CHECK-NEXT: retq
++
++define i32 @test1(i32 %x, i32 %y, i32 %z) {
++entry:
++    %tmp = mul i32 %x, %y
++    %tmp2 = add i32 %tmp, %z
++    ret i32 %tmp2
++}
+\ No newline at end of file
+-- 
+2.21.0
+
